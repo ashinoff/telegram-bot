@@ -1,0 +1,4 @@
+telebot
+pandas
+requests
+openpyxl
