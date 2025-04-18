@@ -37,7 +37,7 @@ def handle_message(update, context):
 
     query = update.message.text.strip()
     if not query.isdigit():
-        context.bot.send_message(chat_id=update.effective_chat.id, text="Пожалуйста, введите номер (только цифры).")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Пожалуйста, введите номер счетчика (только цифры).")
         return
 
     df = load_data()
