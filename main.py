@@ -1,39 +1,45 @@
-import telebot
+mport os
 import pandas as pd
+import telegram
+from telegram.ext import Updater, MessageHandler, Filters
 import requests
 from io import BytesIO
-import os
 
-TOKEN = os.environ.get('TOKEN')
-FILE_URL = 'https://docs.google.com/uc?export=download&id=1s2zMtwdMaHJSOCXflfw4puL5kzIbiObb'
+# Ссылка на Excel-файл
+EXCEL_URL = "https://docs.google.com/uc?export=download&id=1s2zMtwdMaHJSOCXflfw4puL5kzIbiObb"
 
-bot = telebot.TeleBot(TOKEN)
+def load_data():
+    response = requests.get(EXCEL_URL)
+    file_data = BytesIO(response.content)
+    df = pd.read_excel(file_data, engine='openpyxl')
+    return df
 
-def load_excel():
-    response = requests.get(FILE_URL)
-    return pd.read_excel(BytesIO(response.content))
+def handle_message(update, context):
+    query = update.message.text.strip()
+    if not query.isdigit():
+        update.message.reply_text("Пожалуйста, введите номер (только цифры).")
+        return
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "Привет! Введи номер из первого столбца (№ п/п), и я покажу данные по этой строке.")
+    df = load_data()
+    row = df[df.iloc[:, 0] == int(query)]
 
-@bot.message_handler(func=lambda msg: msg.text.strip().isdigit())
-def get_row(message):
-    number = int(message.text.strip())
-    df = load_excel()
-    df.columns = [str(col).strip() for col in df.columns]
-    first_column = df.columns[0]
-
-    row_match = df[df[first_column] == number]
-
-    if row_match.empty:
-        bot.send_message(message.chat.id, "Такой строки не найдено.")
+    if row.empty:
+        update.message.reply_text("Номер не найден.")
     else:
-        row = row_match.iloc[0]
+        row = row.iloc[0]
         response = ""
         for col in df.columns[1:]:
             response += f"{col}: {row[col]}\n"
-"
-        bot.send_message(message.chat.id, response.strip())
+        update.message.reply_text(response)
 
-bot.polling()
+def main():
+    token = os.environ.get("TOKEN")
+    updater = Updater(token, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
+
