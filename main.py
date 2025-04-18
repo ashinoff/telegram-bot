@@ -20,7 +20,7 @@ allowed_ids = os.environ.get("ALLOWED_IDS", "")
 ALLOWED_USERS = [int(x) for x in allowed_ids.split(",") if x.strip().isdigit()]
 
 # Excel-файл
-EXCEL_URL = "https://docs.google.com/uc?export=download&id=1s2zMtwdMaHJSOCXflfw4puL5kzIbiObb"
+EXCEL_URL = "https://docs.google.com/spreadsheets/d/1JWG4YLxd7ltI_K1JASKC1z6gpP-dEa8P/edit?usp=drive_link&ouid=116607731149286795427&rtpof=true&sd=true"
 
 def load_data():
     response = requests.get(EXCEL_URL)
