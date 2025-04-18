@@ -12,8 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Бот работает, чуть больше чем ты!"
-
+return "Бот работает, чуть больше чем ты!"
 # Получаем список разрешённых ID из переменной окружения
 allowed_ids = os.environ.get("ALLOWED_IDS", "")
 ALLOWED_USERS = [int(x) for x in allowed_ids.split(",") if x.strip().isdigit()]
