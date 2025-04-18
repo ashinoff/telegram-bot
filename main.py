@@ -1,21 +1,21 @@
 import os
-import threading
 import pandas as pd
 import telegram
-from telegram.ext import Updater, MessageHandler, Filters
+from telegram.ext import Dispatcher, MessageHandler, Filters
+from flask import Flask, request
 import requests
 from io import BytesIO
-from flask import Flask
-import time
 
-# Flask-приложение для Render Web Service
+# Инициализация Flask
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return "Бот работает!"
+# Telegram Token и URL
+TOKEN = os.environ.get("TOKEN")
+SELF_URL = os.environ.get("SELF_URL")  # например, https://yourbot.onrender.com
 
-# Получаем список разрешённых Telegram ID
+bot = telegram.Bot(token=TOKEN)
+
+# ALLOWED USERS
 allowed_ids = os.environ.get("ALLOWED_IDS", "")
 ALLOWED_USERS = [int(x) for x in allowed_ids.split(",") if x.strip().isdigit()]
 
@@ -28,60 +28,50 @@ def load_data():
     df = pd.read_excel(file_data, engine='openpyxl')
     return df
 
-# Ответ на сообщения
+# Обработка сообщений
 def handle_message(update, context):
     user_id = update.effective_user.id
     if user_id not in ALLOWED_USERS:
-        update.message.reply_text("Пошёл на хуй, я тебя не знаю!")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Пошёл на хуй, я тебя не знаю!")
         return
 
     query = update.message.text.strip()
     if not query.isdigit():
-        update.message.reply_text("Пожалуйста, введите номер (только цифры).")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Пожалуйста, введите номер (только цифры).")
         return
 
     df = load_data()
     row = df[df.iloc[:, 0] == int(query)]
 
     if row.empty:
-        update.message.reply_text("Номер не найден.")
+        context.bot.send_message(chat_id=update.effective_chat.id, text="Номер не найден.")
     else:
         row = row.iloc[0]
         response = ""
         for col in df.columns[1:]:
             response += f"{col}: {row[col]}\n"
-        update.message.reply_text(response)
+        context.bot.send_message(chat_id=update.effective_chat.id, text=response)
 
-# Запуск Telegram-бота
-def run_bot():
-    token = os.environ.get("TOKEN")
-    updater = Updater(token, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    updater.start_polling()
-    updater.idle()
+# Настройка dispatcher
+from telegram.ext import CallbackContext
+dispatcher = Dispatcher(bot, None, workers=0)
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-# Авто-пинг сам себя каждые 5 минут
-def keep_alive():
-    url = os.environ.get("SELF_URL")
-    if not url:
-        print("SELF_URL не указан, авто-пинг отключён")
-        return
+# Flask маршрут для Telegram webhook
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    update = telegram.Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return 'ok'
 
-    def ping():
-        while True:
-            try:
-                requests.get(url)
-                print("Пинг отправлен")
-            except Exception as e:
-                print(f"Ошибка пинга: {e}")
-            time.sleep(300)
+# Корневой маршрут (для проверки, что бот жив)
+@app.route('/')
+def index():
+    return 'Бот на webhook работает!'
 
-    threading.Thread(target=ping).start()
-
-# Запуск
-if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    keep_alive()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# Установка webhook
+if __name__ == '__main__':
+    webhook_url = f"{SELF_URL}/{TOKEN}"
+    bot.delete_webhook()
+    bot.set_webhook(url=webhook_url)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
