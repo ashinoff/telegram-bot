@@ -32,7 +32,7 @@ def get_row(message):
         row = row_match.iloc[0]
         response = ""
         for col in df.columns[1:]:
-            response += f"{col}: {row[col]}
+            response += f"{col}: {row[col]}\n"
 "
         bot.send_message(message.chat.id, response.strip())
 
