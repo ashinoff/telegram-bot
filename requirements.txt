@@ -1,5 +1,4 @@
+gspread
+oauth2client
 python-telegram-bot==13.15
-Flask
 pandas
-openpyxl
-requests
