@@ -1,95 +1,128 @@
 import os
-import pandas as pd
 import telegram
-from telegram.ext import Dispatcher, MessageHandler, Filters
-from flask import Flask, request
-import requests
-from io import BytesIO
+from telegram import ReplyKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import CallbackQueryHandler, ConversationHandler
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+from datetime import datetime, timedelta
 
-# Flask-приложение
-app = Flask(__name__)
+# Авторизация в Google Sheets
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(
+    os.environ["GOOGLE_CREDENTIALS_PATH"], scope
+)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(os.environ["SHEET_ID"]).worksheet(os.environ["SHEET_NAME"])
 
-# Telegram настройки
-TOKEN = os.environ.get("TOKEN")
-SELF_URL = os.environ.get("SELF_URL")
-bot = telegram.Bot(token=TOKEN)
+# Получение REES_MAP
+REES_MAP = {
+    int(pair.split(":")[0]): pair.split(":")[1]
+    for pair in os.environ.get("REES_MAP", "").split(",")
+}
 
-# Список разрешённых ID
-allowed_ids = os.environ.get("ALLOWED_IDS", "")
-ALLOWED_USERS = [int(x) for x in allowed_ids.split(",") if x.strip().isdigit()]
+# Хранилище состояний
+user_context = {}
 
-# ССЫЛКА НА GOOGLE ТАБЛИЦУ
-EXCEL_URL = "https://docs.google.com/uc?export=download&id=1JWG4YLxd7ltI_K1JASKC1z6gpP-dEa8P"
+# Заголовки по категориям
+INFO_FIELDS = {
+    "Информация по договору": [
+        "ТУ", "Номер ТУСТЕК", "Номер ТУ", "ЛС / ЛС СТЕК",
+        "Наименование договора", "Вид потребителя", "Субабонент"
+    ],
+    "Информация по адресу подключения": [
+        "Сетевой участок", "Населенный пункт", "Улица", "Дом", "ТП"
+    ],
+    "Информация по прибору учета": [
+        "Номер счетчика", "Состояние ТУ", "Максимальная мощность", "Вид счетчика",
+        "Фазность", "Госповерка счетчика", "Межповерочный интервал ПУ",
+        "Окончание срок поверки", "Проверка схемы дата",
+        "Последнее активное событие дата", "Первичный ток ТТ (А)",
+        "Госповерка ТТ (А)", "Межповерочный интервал ТТ"
+    ]
+}
 
-def load_data():
-    try:
-        response = requests.get(EXCEL_URL)
-        response.raise_for_status()
-        file_data = BytesIO(response.content)
-        df = pd.read_excel(file_data, engine='openpyxl')
-        return df
-    except Exception as e:
-        print(f"Ошибка загрузки Excel: {e}")
-        return None
+# Обработка сообщений
+def handle_message(update, context: CallbackContext):
+    chat_id = update.effective_user.id
+    user_input = update.message.text.strip()
 
-def handle_message(update, context):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    print(f"Запрос от пользователя: {user_id}")
-
-    if user_id not in ALLOWED_USERS:
-        context.bot.send_message(chat_id=chat_id, text="Пошёл на хуй, я тебя не знаю!")
+    # Проверка доступа
+    user_res = REES_MAP.get(chat_id)
+    if not user_res:
+        update.message.reply_text("Ты мне не знаком — до свидания.")
         return
 
-    query = update.message.text.strip()
-    if not query.isdigit():
-        context.bot.send_message(chat_id=chat_id, text="Пожалуйста, введите номер (только цифры).")
+    if not user_input.isdigit():
+        update.message.reply_text("Введите номер счётчика (только цифры).")
         return
 
-    context.bot.send_message(chat_id=chat_id, text="Запрос получен. Ищу данные, подожди немного...")
+    df = pd.DataFrame(sheet.get_all_records())
+    if user_res != "ALL":
+        df = df[df["Сетевой участок"] == user_res]
 
-    df = load_data()
-    if df is None:
-        context.bot.send_message(chat_id=chat_id, text="Ошибка загрузки таблицы. Попробуй позже.")
+    row = df[df["Номер счетчика"] == int(user_input)]
+    if row.empty:
+        update.message.reply_text("Номер счётчика не найден.")
         return
 
-    try:
-        row = df[df.iloc[:, 0] == int(query)]
-        if row.empty:
-            context.bot.send_message(chat_id=chat_id, text="Номер не найден.")
-        else:
-            row = row.iloc[0]
-            response = ""
+    # Сохраняем контекст
+    user_context[chat_id] = {
+        "last_query": row.iloc[0].to_dict(),
+        "last_time": datetime.now()
+    }
 
-            for col in df.columns[1:11]:  # первые 10 столбцов
-                response += f"{col}: {row[col]}\n"
+    keyboard = [["Информация по договору"],
+                ["Информация по адресу подключения"],
+                ["Информация по прибору учета"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=False, resize_keyboard=True)
 
-            if len(response) > 4000:
-                response = response[:4000] + "\n...Обрезано по длине"
-
-            context.bot.send_message(chat_id=chat_id, text=response)
-    except Exception as e:
-        print(f"Ошибка обработки данных: {e}")
-        context.bot.send_message(chat_id=chat_id, text="Произошла ошибка при обработке данных.")
-
-# Telegram webhook (обработка POST-запроса)
+    update.message.reply_text("Что именно вас интересует?", reply_markup=reply_markup)
 from telegram.ext import CallbackContext
-dispatcher = Dispatcher(bot, None, workers=0)
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-@app.route(f'/{TOKEN}', methods=['POST'])
-def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return 'ok'
+# Обработка выбора кнопки
+def handle_button(update, context: CallbackContext):
+    chat_id = update.effective_user.id
+    text = update.message.text.strip()
 
-@app.route('/')
-def index():
-    return 'Бот на webhook работает!'
+    # Проверка: есть ли активный номер?
+    if chat_id not in user_context:
+        update.message.reply_text("Сначала введите номер счётчика.")
+        return
 
-# Установка webhook при запуске
-if __name__ == '__main__':
-    webhook_url = f"{SELF_URL}/{TOKEN}"
-    bot.delete_webhook()
-    bot.set_webhook(url=webhook_url)
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    session = user_context[chat_id]
+    elapsed = datetime.now() - session["last_time"]
+    if elapsed > timedelta(minutes=10):
+        update.message.reply_text("Время сессии истекло. Введите номер счётчика заново.")
+        user_context.pop(chat_id, None)
+        return
+
+    row = session["last_query"]
+    if text not in INFO_FIELDS:
+        update.message.reply_text("Неверный выбор. Используйте кнопки.")
+        return
+
+    fields = INFO_FIELDS[text]
+    response = "\n".join([f"{field}: {row.get(field, '—')}" for field in fields])
+    update.message.reply_text(response)
+
+# Команда /start
+def start(update, context):
+    update.message.reply_text("Привет! Введите номер счётчика для начала.")
+
+# Запуск бота
+def main():
+    token = os.environ["TOKEN"]
+    updater = Updater(token, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.regex(r"^\d+$"), handle_message))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_button))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
