@@ -1,115 +1,119 @@
 import os
 import pandas as pd
-import telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
 import requests
 from io import BytesIO
 from datetime import datetime, timedelta
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, Filters, CallbackContext
+import threading
+import time
 
-EXCEL_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRC4rukIYI8jEnmgm5kIxmFa67xMcmgHNA1efWv5o87HE9-2_g9GmkNfB__JNK0Kw/pub?output=xlsx"
+EXCEL_URL = os.environ.get("EXCEL_URL")
+REES_MAP = {p.split(":")[0]: p.split(":")[1] for p in os.environ.get("REES_MAP", "").split(",")}
 TOKEN = os.environ.get("TOKEN")
-REES_MAP = {
-    '955536270': 'ALL',
-    '7960394970': 'Сочинский РЭС'
-}
+SELF_URL = os.environ.get("SELF_URL")
 
-# Категории заголовков
+user_data = {}
+TIMEOUT = 600  # 10 минут
+
 CATEGORIES = {
     'contract': ['ТУ', 'Номер ТУСТЕК', 'Номер ТУ', 'ЛС / ЛС СТЕК', 'Наименование договора', 'Вид потребителя', 'Субабонент'],
     'address': ['Сетевой участок', 'Населенный пункт', 'Улица', 'Дом', 'ТП'],
-    'device': ['Номер счетчика', 'Состояние ТУ', 'Максимальная мощность', 'Вид счетчика', 'Фазность',
-               'Госповерка счетчика', 'Межповерочный интервал ПУ', 'Окончание срок поверки',
-               'Проверка схемы дата', 'Последнее активное событие дата',
-               'Первичный ток ТТ (А)', 'Госповерка ТТ (А)', 'Межповерочный интервал ТТ']
+    'meter': ['Номер счетчика', 'Состояние ТУ', 'Максимальная мощность', 'Вид счетчика', 'Фазность',
+              'Госповерка счетчика', 'Межповерочный интервал ПУ', 'Окончание срок поверки',
+              'Проверка схемы дата', 'Последнее активное событие дата',
+              'Первичный ток ТТ (А)', 'Госповерка ТТ (А)', 'Межповерочный интервал ТТ']
 }
-
-# Временное хранилище
-user_requests = {}
 
 def load_data():
     response = requests.get(EXCEL_URL)
-    file_data = BytesIO(response.content)
-    df = pd.read_excel(file_data)
+    df = pd.read_excel(BytesIO(response.content), engine='openpyxl')
     return df
 
-def start(update, context):
+def start(update: Update, context: CallbackContext):
     update.message.reply_text("Введите номер счётчика:")
 
-def handle_message(update, context):
+def handle_number(update: Update, context: CallbackContext):
     user_id = str(update.effective_user.id)
-    query = update.message.text.strip()
+    text = update.message.text.strip()
 
-    if not query.isdigit():
-        update.message.reply_text("Пожалуйста, введите номер (только цифры).")
+    if not text.isdigit():
+        update.message.reply_text("Введите номер счётчика (только цифры).")
         return
 
-    df = load_data()
     access = REES_MAP.get(user_id)
-
     if not access:
         update.message.reply_text("Пошёл на х*й, я тебя не знаю!")
+        return
+
+    try:
+        df = load_data()
+    except Exception as e:
+        update.message.reply_text(f"Ошибка загрузки файла: {e}")
         return
 
     if access != 'ALL':
         df = df[df['Сетевой участок'] == access]
 
-    row = df[df.iloc[:, 0] == int(query)]
+    row = df[df['Номер счетчика'] == int(text)]
     if row.empty:
-        update.message.reply_text("Номер не найден.")
+        update.message.reply_text("Счётчик не найден.")
         return
 
-    # Сохраняем номер и время последнего запроса
-    user_requests[user_id] = {
-        'data': row.iloc[0],
-        'timestamp': datetime.utcnow()
+    user_data[user_id] = {
+        'row': row.iloc[0].to_dict(),
+        'time': datetime.utcnow()
     }
 
-    keyboard = [
+    buttons = [
         [InlineKeyboardButton("Информация по договору", callback_data='contract')],
         [InlineKeyboardButton("Информация по адресу подключения", callback_data='address')],
-        [InlineKeyboardButton("Информация по прибору учёта", callback_data='device')]
+        [InlineKeyboardButton("Информация по прибору учёта", callback_data='meter')]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Что именно вас интересует?", reply_markup=reply_markup)
+    update.message.reply_text("Выберите, что вас интересует:", reply_markup=InlineKeyboardMarkup(buttons))
 
-def button_handler(update, context):
+def handle_button(update: Update, context: CallbackContext):
     query = update.callback_query
-    user_id = str(query.from_user.id)
     query.answer()
+    user_id = str(query.from_user.id)
 
-    info = user_requests.get(user_id)
-    if not info or datetime.utcnow() - info['timestamp'] > timedelta(minutes=10):
+    data = user_data.get(user_id)
+    if not data:
+        query.edit_message_text("Сначала введите номер счётчика.")
+        return
+
+    if datetime.utcnow() - data['time'] > timedelta(seconds=TIMEOUT):
+        user_data.pop(user_id, None)
         query.edit_message_text("Сессия устарела. Введите номер счётчика заново.")
         return
 
     category = query.data
-    row = info['data']
     fields = CATEGORIES.get(category, [])
-
-    response = '\n'.join(f"{field}: {row.get(field, '—')}" for field in fields)
+    row = data['row']
+    response = "\n".join(f"{field}: {row.get(field, '—')}" for field in fields)
     query.edit_message_text(response)
 
-def ping_self(context):
-    try:
-        requests.get(os.environ.get("SELF_URL", "https://example.com"))
-    except:
-        pass
+def ping_self():
+    while True:
+        try:
+            if SELF_URL:
+                requests.get(SELF_URL)
+        except:
+            pass
+        time.sleep(300)
 
 def main():
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    dp.add_handler(CallbackQueryHandler(button_handler))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_number))
+    dp.add_handler(CallbackQueryHandler(handle_button))
 
-    # Самопинг каждые 5 минут
-    job_queue = updater.job_queue
-    job_queue.run_repeating(ping_self, interval=300, first=10)
+    threading.Thread(target=ping_self, daemon=True).start()
 
     updater.start_polling()
     updater.idle()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
