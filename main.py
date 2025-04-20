@@ -70,7 +70,7 @@ def handle_message(update: Update, ctx: CallbackContext):
     if text_raw in ["Информация по договору", "Информация по адресу подключения", "Информация по прибору учёта"]:
         st = user_states.get(user_id)
         if not st:
-            return update.message.reply_text("Сначала введите номер счётчика или ЛС")
+            return update.message.reply_text("Сначала введите номер счётчика")
         return send_info(update, st["number"], text_raw, st["region"])
 
     # определяем область видимости
