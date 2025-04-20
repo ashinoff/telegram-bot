@@ -10,87 +10,66 @@ from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, Ca
 
 app = Flask(__name__)
 
-# === Настройки из окружения ===
-TOKEN          = os.getenv("TOKEN")
-SELF_URL       = os.getenv("SELF_URL")
-
-# Старый подход с зонами, если он у вас ещё остался:
-# USER_REES_MAP = { "123": "Краснополянский РЭС", … }
-# REES_SHEETS_MAP = { "Краснополянский РЭС": "https://…/export?format=xlsx", … }
-
-# Или, если вы перешли на CSV‑зоны:
-ZONES_CSV_URL  = os.getenv("ZONES_CSV_URL")
+TOKEN         = os.getenv("TOKEN")
+SELF_URL      = os.getenv("SELF_URL")
+ZONES_CSV_URL = os.getenv("ZONES_CSV_URL")    # CSV‑URL таблицы зон (ID,Region)
 REES_SHEETS_MAP = {
     p.split("=",1)[0]: p.split("=",1)[1]
     for p in os.getenv("REES_SHEETS_MAP","").split(",") if p
 }
 
-bot         = Bot(token=TOKEN)
-dispatcher  = Dispatcher(bot, None, use_context=True)
+bot        = Bot(token=TOKEN)
+dispatcher = Dispatcher(bot, None, use_context=True)
 user_states = {}
 
 LOGS_FILE = "logs.csv"
-
-# при старте — если нет файла, создаём с заголовком
 if not os.path.exists(LOGS_FILE):
     with open(LOGS_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["user_id", "timestamp", "number"])
+        csv.writer(f).writerow(["user_id", "timestamp", "number"])
 
-def load_zones_map() -> dict:
-    """Если вы используете CSV‑зоны."""
-    resp = requests.get(ZONES_CSV_URL)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.text), dtype=str)
+def load_zones_map():
+    r = requests.get(ZONES_CSV_URL); r.raise_for_status()
+    df = pd.read_csv(StringIO(r.text), dtype=str)
     return dict(zip(df["ID"].str.strip(), df["Region"].str.strip()))
 
-def log_request(user_id: str, number: str):
-    """Дописываем строку в logs.csv."""
+def log_request(user_id, number):
     ts = datetime.datetime.now().isoformat()
     with open(LOGS_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([user_id, ts, number])
+        csv.writer(f).writerow([user_id, ts, number])
 
-def load_data(excel_url: str) -> pd.DataFrame:
-    r = requests.get(excel_url)
-    r.raise_for_status()
+def load_data(excel_url):
+    r = requests.get(excel_url); r.raise_for_status()
     return pd.read_excel(pd.io.common.BytesIO(r.content), dtype=str)
 
-@dispatcher.add_handler(CommandHandler("start"))
-def start(update: Update, ctx: CallbackContext):
+def start(update: Update, context: CallbackContext):
     update.message.reply_text("Введите номер счётчика или ЛС")
 
-@dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command))
-def handle_message(update: Update, ctx: CallbackContext):
+def handle_message(update: Update, context: CallbackContext):
     user_id  = str(update.message.from_user.id)
     text_raw = update.message.text.strip()
-    norm     = text_raw.lstrip("0") or "0"
 
-    # выбор типа инфо
-    if text_raw in ["Информация по договору", "Информация по адресу подключения", "Информация по прибору учёта"]:
+    # выбор типа информации
+    if text_raw in ("Информация по договору", "Информация по адресу подключения", "Информация по прибору учёта"):
         st = user_states.get(user_id)
         if not st:
-            return update.message.reply_text("Сначала введите номер счётчика")
+            return update.message.reply_text("Сначала введите номер счётчика или ЛС")
         return send_info(update, st["number"], text_raw, st["region"])
 
-    # определяем область видимости
-    if ZONES_CSV_URL:
-        zones  = load_zones_map()
-        region = zones.get(user_id)
-    else:
-        region = USER_REES_MAP.get(user_id)
+    # ввод номера
+    zones  = load_zones_map()
+    region = zones.get(user_id)
     if not region:
         return update.message.reply_text("У вас нет прав или вы не назначены ни в один РЭС.")
 
-    found_reg = None
-    matched   = None
+    norm_input = text_raw.lstrip("0") or "0"
+    found_reg, matched = None, None
 
     if region.upper() == "ALL":
         for reg, url in REES_SHEETS_MAP.items():
             df  = load_data(url)
             ser = df["Номер счетчика"].astype(str)
-            n   = ser.str.lstrip("0").replace("", "0")
-            mask = n == norm
+            norm = ser.str.lstrip("0").replace("", "0")
+            mask = norm == norm_input
             if mask.any():
                 found_reg = reg
                 matched   = ser[mask].iloc[0]
@@ -101,25 +80,22 @@ def handle_message(update: Update, ctx: CallbackContext):
         url = REES_SHEETS_MAP.get(region)
         df  = load_data(url)
         ser = df["Номер счетчика"].astype(str)
-        n   = ser.str.lstrip("0").replace("", "0")
-        mask = n == norm
+        norm = ser.str.lstrip("0").replace("", "0")
+        mask = norm == norm_input
         if not mask.any():
             return update.message.reply_text("Номер не найден. Проверьте ввод.")
-        found_reg = region
-        matched   = ser[mask].iloc[0]
+        found_reg, matched = region, ser[mask].iloc[0]
 
-    # логируем
     log_request(user_id, matched)
 
-    # спрашиваем, что дальше
     user_states[user_id] = {"number": matched, "region": found_reg}
     kb = [
         ["Информация по договору"],
         ["Информация по адресу подключения"],
         ["Информация по прибору учёта"],
     ]
-    markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=False)
-    update.message.reply_text("Принял в работу. Что ищем?", reply_markup=markup)
+    reply_markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    update.message.reply_text("Принял в работу. Что ищем?", reply_markup=reply_markup)
 
 def send_info(update: Update, number: str, info_type: str, region: str):
     df  = load_data(REES_SHEETS_MAP[region])
@@ -131,10 +107,12 @@ def send_info(update: Update, number: str, info_type: str, region: str):
     elif info_type == "Информация по адресу подключения":
         cols = ["Сетевой участок","Населенный пункт","Улица","Дом","ТП"]
     else:
-        cols = ["Номер счетчика","Состояние ТУ","Максимальная мощность","Вид счетчика","Фазность",
-                "Госповерка счетчика","Межповерочный интервал ПУ","Окончание срок поверки",
-                "Проверка схемы дата","Последнее активное событие дата",
-                "Первичный ток ТТ (А)","Госповерка ТТ (А)","Межповерочный интервал ТТ"]
+        cols = [
+            "Номер счетчика","Состояние ТУ","Максимальная мощность","Вид счетчика","Фазность",
+            "Госповерка счетчика","Межповерочный интервал ПУ","Окончание срок поверки",
+            "Проверка схемы дата","Последнее активное событие дата",
+            "Первичный ток ТТ (А)","Госповерка ТТ (А)","Межповерочный интервал ТТ"
+        ]
     data = row.iloc[0]
     msg  = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
     update.message.reply_text(msg)
@@ -145,12 +123,12 @@ def webhook():
     dispatcher.process_update(upd)
     return "ok"
 
-@app.route("/download_logs")
+@app.route("/download_logs", methods=["GET"])
 def download_logs():
-    """Позволяет скачать файл logs.csv через HTTP."""
-    return send_file(LOGS_FILE, as_attachment=True, 
-                     attachment_filename="logs.csv", 
-                     mimetype="text/csv")
+    return send_file(LOGS_FILE, as_attachment=True, attachment_filename="logs.csv", mimetype="text/csv")
+
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 if __name__ == "__main__":
     bot.set_webhook(f"{SELF_URL}/webhook")
