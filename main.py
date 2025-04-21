@@ -8,42 +8,51 @@ from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, Ca
 
 app = Flask(__name__)
 
-# === Переменные окружения ===
+# === ENV ===
 TOKEN           = os.getenv("TOKEN")
 SELF_URL        = os.getenv("SELF_URL")
-ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")   # CSV‑URL таблицы зон: ID,Region,Name
+ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")   # CSV с колонками ID,Region,Name(или Имя)
 REES_SHEETS_MAP = {
     p.split("=",1)[0]: p.split("=",1)[1]
-    for p in os.getenv("REES_SHEETS_MAP", "").split(",") if p
+    for p in os.getenv("REES_SHEETS_MAP","").split(",") if p
 }
 
-# === Инициализация бота ===
 bot        = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# хранит состояние по юзеру: номер, регион, имя
-user_states = {}  # { user_id: {"number": str, "region": str, "name": str} }
+# хранит для каждого user_id: number, region, name
+user_states = {}
 
 def load_zones_map() -> dict:
     """
-    Загружает CSV‑таблицу зон (ID,Region,Name) и возвращает
+    Скачивает CSV (ID,Region,Name/Имя/3я колонка) и возвращает
       { user_id: {"region": str, "name": str} }
     """
     resp = requests.get(ZONES_CSV_URL)
     resp.raise_for_status()
-    # убираем BOM, если есть
     text = resp.content.decode("utf-8-sig")
     df = pd.read_csv(StringIO(text), dtype=str)
-    result = {}
+
+    # определяем, как зовётся колонка с именем
+    if "Name" in df.columns:
+        name_col = "Name"
+    elif "Имя" in df.columns:
+        name_col = "Имя"
+    elif len(df.columns) >= 3:
+        name_col = df.columns[2]
+    else:
+        name_col = None
+
+    zones = {}
     for _, row in df.iterrows():
-        uid   = row["ID"].strip()
-        region= row["Region"].strip()
-        name  = row["Name"].strip()
-        result[uid] = {"region": region, "name": name}
-    return result
+        uid    = row["ID"].strip()
+        region = row["Region"].strip()
+        name   = row[name_col].strip() if name_col and pd.notna(row.get(name_col, "")) else ""
+        zones[uid] = {"region": region, "name": name}
+    return zones
 
 def load_data(excel_url: str) -> pd.DataFrame:
-    """Скачивает XLSX‑таблицу РЭС по URL и возвращает DataFrame."""
+    """Скачивает XLSX‑таблицу по URL и возвращает pandas.DataFrame."""
     r = requests.get(excel_url)
     r.raise_for_status()
     return pd.read_excel(pd.io.common.BytesIO(r.content), dtype=str)
@@ -55,29 +64,26 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = str(update.message.from_user.id)
     text    = update.message.text.strip()
 
-    # повторный выбор информации
-    if text in ("Информация по договору",
-                "Информация по адресу подключения",
-                "Информация по прибору учёта"):
+    # если это кнопка «Информация…»
+    if text in ("Информация по договору", "Информация по адресу подключения", "Информация по прибору учёта"):
         st = user_states.get(user_id)
         if not st:
             return update.message.reply_text("Сначала введите номер счётчика")
         return send_info(update, st["number"], text, st["region"])
 
-    # загружаем зоны и получаем регион+имя
-    zones = load_zones_map()
+    # иначе — вводим номер
+    try:
+        zones = load_zones_map()
+    except Exception as e:
+        return update.message.reply_text(f"❌ Не удалось загрузить зоны: {e}")
     user_info = zones.get(user_id)
     if not user_info:
         return update.message.reply_text("У вас нет прав или вы не назначены ни в один РЭС.")
-    region    = user_info["region"]
-    user_name = user_info["name"]
+    region, user_name = user_info["region"], user_info["name"]
 
-    # нормализуем ввод
     norm_input = text.lstrip("0") or "0"
-    found_reg  = None
-    matched    = None
+    found_reg, matched = None, None
 
-    # ищем по всем или по конкретному региону
     if region.upper() == "ALL":
         for reg, url in REES_SHEETS_MAP.items():
             df   = load_data(url)
@@ -102,13 +108,10 @@ def handle_message(update: Update, context: CallbackContext):
             return update.message.reply_text("Номер не найден. Проверьте ввод.")
         found_reg, matched = region, ser[mask].iloc[0]
 
-    # сохраняем состояние и обращаемся по имени
-    user_states[user_id] = {
-        "number": matched,
-        "region": found_reg,
-        "name":   user_name
-    }
-    update.message.reply_text(f"Принял в работу, {user_name}")
+    # сохраним и обратимся по имени (если есть)
+    user_states[user_id] = {"number": matched, "region": found_reg, "name": user_name}
+    greet = f"Принял в работу, {user_name}" if user_name else "Принял в работу"
+    update.message.reply_text(greet)
 
     keyboard = [
         ["Информация по договору"],
@@ -136,8 +139,8 @@ def send_info(update: Update, number: str, info_type: str, region: str):
             "Первичный ток ТТ (А)","Госповерка ТТ (А)","Межповерочный интервал ТТ"
         ]
     data = row.iloc[0]
-    message = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
-    update.message.reply_text(message)
+    msg  = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
+    update.message.reply_text(msg)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -149,7 +152,6 @@ def webhook():
 def index():
     return "Бот работает"
 
-# Регистрируем обработчики
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
