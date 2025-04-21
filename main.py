@@ -1,39 +1,56 @@
 import os
+import threading
 import pandas as pd
 import requests
-from io import StringIO
+from io import BytesIO
 from flask import Flask, request
 from telegram import Bot, Update, ReplyKeyboardMarkup
 from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
 
 app = Flask(__name__)
 
-# === ENV ===
+# === Переменные окружения ===
 TOKEN           = os.getenv("TOKEN")
 SELF_URL        = os.getenv("SELF_URL")
-ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")   # CSV с колонками ID,Region,Name(или Имя)
+ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")  # CSV‑URL таблицы зон (ID,Region,Name)
 REES_SHEETS_MAP = {
-    p.split("=",1)[0]: p.split("=",1)[1]
-    for p in os.getenv("REES_SHEETS_MAP","").split(",") if p
+    pair.split("=",1)[0]: pair.split("=",1)[1]
+    for pair in os.getenv("REES_SHEETS_MAP","").split(",") if pair
 }
 
 bot        = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
+user_states = {}  # { user_id: {"number": str, "region": str, "name": str} }
 
-# хранит для каждого user_id: number, region, name
-user_states = {}
+# === Предзагрузка всех таблиц РЭС в память ===
+DATA_CACHE = {}
+
+def refresh_cache():
+    """
+    Загружает все XLSX из REES_SHEETS_MAP в DATA_CACHE и
+    планирует сам себя через 1 час.
+    """
+    for region, url in REES_SHEETS_MAP.items():
+        try:
+            resp = requests.get(url)
+            resp.raise_for_status()
+            DATA_CACHE[region] = pd.read_excel(BytesIO(resp.content), dtype=str)
+        except Exception as e:
+            # Если не удалось загрузить — оставляем старые данные (если были)
+            print(f"Error refreshing cache for {region}: {e}")
+    # Запланировать следующий запуск через 1 час
+    threading.Timer(3600, refresh_cache).start()
+
+# Запуск предзагрузки при старте
+refresh_cache()
 
 def load_zones_map() -> dict:
-    """
-    Скачивает CSV (ID,Region,Name/Имя/3я колонка) и возвращает
-      { user_id: {"region": str, "name": str} }
-    """
+    """Скачивает CSV‑таблицу зон и возвращает { user_id: {"region","name"} }."""
     resp = requests.get(ZONES_CSV_URL)
     resp.raise_for_status()
     text = resp.content.decode("utf-8-sig")
-    df = pd.read_csv(StringIO(text), dtype=str)
-
-    # определяем, как зовётся колонка с именем
+    df = pd.read_csv(BytesIO(text.encode()), dtype=str)
+    # Определяем колонку с именем
     if "Name" in df.columns:
         name_col = "Name"
     elif "Имя" in df.columns:
@@ -51,12 +68,6 @@ def load_zones_map() -> dict:
         zones[uid] = {"region": region, "name": name}
     return zones
 
-def load_data(excel_url: str) -> pd.DataFrame:
-    """Скачивает XLSX‑таблицу по URL и возвращает pandas.DataFrame."""
-    r = requests.get(excel_url)
-    r.raise_for_status()
-    return pd.read_excel(pd.io.common.BytesIO(r.content), dtype=str)
-
 def start(update: Update, context: CallbackContext):
     update.message.reply_text("Введите номер счётчика")
 
@@ -64,18 +75,20 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = str(update.message.from_user.id)
     text    = update.message.text.strip()
 
-    # если это кнопка «Информация…»
-    if text in ("Информация по договору", "Информация по адресу подключения", "Информация по прибору учёта"):
+    # Если это кнопка «Информация…», сразу показываем
+    if text in ("Информация по договору",
+                "Информация по адресу подключения",
+                "Информация по прибору учёта"):
         st = user_states.get(user_id)
         if not st:
             return update.message.reply_text("Сначала введите номер счётчика")
         return send_info(update, st["number"], text, st["region"])
 
-    # иначе — вводим номер
+    # Иначе — вводим номер счётчика
     try:
         zones = load_zones_map()
     except Exception as e:
-        return update.message.reply_text(f"❌ Не удалось загрузить зоны: {e}")
+        return update.message.reply_text(f"Ошибка загрузки зон: {e}")
     user_info = zones.get(user_id)
     if not user_info:
         return update.message.reply_text("У вас нет прав или вы не назначены ни в один РЭС.")
@@ -84,9 +97,9 @@ def handle_message(update: Update, context: CallbackContext):
     norm_input = text.lstrip("0") or "0"
     found_reg, matched = None, None
 
+    # Берём данные из кэша
     if region.upper() == "ALL":
-        for reg, url in REES_SHEETS_MAP.items():
-            df   = load_data(url)
+        for reg, df in DATA_CACHE.items():
             ser  = df["Номер счетчика"].astype(str)
             norm = ser.str.lstrip("0").replace("", "0")
             mask = norm == norm_input
@@ -97,10 +110,9 @@ def handle_message(update: Update, context: CallbackContext):
         if not found_reg:
             return update.message.reply_text("Номер не найден ни в одном регионе.")
     else:
-        excel_url = REES_SHEETS_MAP.get(region)
-        if not excel_url:
-            return update.message.reply_text(f"Для региона «{region}» таблица не задана.")
-        df   = load_data(excel_url)
+        df = DATA_CACHE.get(region)
+        if df is None:
+            return update.message.reply_text(f"Таблица для региона «{region}» ещё не загружена.")
         ser  = df["Номер счетчика"].astype(str)
         norm = ser.str.lstrip("0").replace("", "0")
         mask = norm == norm_input
@@ -108,7 +120,7 @@ def handle_message(update: Update, context: CallbackContext):
             return update.message.reply_text("Номер не найден. Проверьте ввод.")
         found_reg, matched = region, ser[mask].iloc[0]
 
-    # сохраним и обратимся по имени (если есть)
+    # Сохраняем состояние и приветствуем по имени
     user_states[user_id] = {"number": matched, "region": found_reg, "name": user_name}
     greet = f"Принял в работу, {user_name}" if user_name else "Принял в работу"
     update.message.reply_text(greet)
@@ -122,7 +134,9 @@ def handle_message(update: Update, context: CallbackContext):
     update.message.reply_text("Что будем искать?", reply_markup=reply_markup)
 
 def send_info(update: Update, number: str, info_type: str, region: str):
-    df  = load_data(REES_SHEETS_MAP[region])
+    df = DATA_CACHE.get(region)
+    if df is None:
+        return update.message.reply_text(f"Таблица для региона «{region}» ещё не загружена.")
     row = df[df["Номер счетчика"].astype(str) == number]
     if row.empty:
         return update.message.reply_text("Данные не найдены.")
@@ -139,8 +153,8 @@ def send_info(update: Update, number: str, info_type: str, region: str):
             "Первичный ток ТТ (А)","Госповерка ТТ (А)","Межповерочный интервал ТТ"
         ]
     data = row.iloc[0]
-    msg  = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
-    update.message.reply_text(msg)
+    message = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
+    update.message.reply_text(message)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -152,6 +166,7 @@ def webhook():
 def index():
     return "Бот работает"
 
+# Регистрируем обработчики
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
