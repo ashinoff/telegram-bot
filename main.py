@@ -1,5 +1,6 @@
 import os
 import threading
+import re
 import pandas as pd
 import requests
 from io import BytesIO, StringIO
@@ -11,11 +12,11 @@ app = Flask(__name__)
 
 # === ENV ===
 TOKEN           = os.getenv("TOKEN")
-SELF_URL        = os.getenv("SELF_URL")      # https://your-bot-url.onrender.com
-ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL") # CSV с колонками ID,Region,Name
+SELF_URL        = os.getenv("SELF_URL")
+ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")
 REES_SHEETS_MAP = {
-    p.split("=",1)[0]: p.split("=",1)[1]
-    for p in os.getenv("REES_SHEETS_MAP","").split(",") if p
+    pair.split("=",1)[0]: pair.split("=",1)[1]
+    for pair in os.getenv("REES_SHEETS_MAP","").split(",") if pair.strip()
 }
 
 # === Google Drive IDs для картинок ===
@@ -31,17 +32,27 @@ IMG_FORMULAS_URL    = BASE_DRIVE_URL + FORMULAS_ID
 bot        = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-user_states = {}   # user_id -> {"mode","number","region","name"}
-known_users = set()
+user_states = {}     # user_id -> {mode, number, region, name}
+known_users = set()  # для рассылки
 
-# === Предзагрузка таблиц РЭС ===
+# === Утилита: из любого google‑sheet URL делаем экспортную ссылку
+def make_export_url(url: str) -> str:
+    m = re.search(r"/d/([^/]+)", url)
+    if not m:
+        return url
+    sheet_id = m.group(1)
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+
+# === ПРЕДЗАГРУЗКА РЭС-ТАБЛИЦ В ПАМЯТЬ ===
 DATA_CACHE = {}
 def refresh_cache():
-    for region, url in REES_SHEETS_MAP.items():
+    for region, raw_url in REES_SHEETS_MAP.items():
+        url = make_export_url(raw_url)
         try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            DATA_CACHE[region] = pd.read_excel(BytesIO(resp.content), dtype=str)
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            DATA_CACHE[region] = pd.read_excel(BytesIO(r.content), dtype=str)
+            print(f"[cache] Loaded {region}")
         except Exception as e:
             print(f"[cache] Error loading {region}: {e}")
     t = threading.Timer(3600, refresh_cache)
@@ -50,7 +61,7 @@ def refresh_cache():
 
 refresh_cache()
 
-# === Клавиатуры ===
+# === КЛАВИАТУРЫ ===
 def main_menu(region):
     items = ["Поиск", "Справочная информация"]
     if region.lower() == "admin":
@@ -70,11 +81,10 @@ INFO_MENU = ReplyKeyboardMarkup([
     ["Информация по прибору учёта", "Назад"]
 ], resize_keyboard=True)
 
-# === Загрузка зон ===
+# === ЗОНЫ И ИМЕНА ===
 def load_zones_map():
-    resp = requests.get(ZONES_CSV_URL, timeout=10)
-    resp.raise_for_status()
-    df = pd.read_csv(StringIO(resp.content.decode("utf-8-sig")), dtype=str)
+    r = requests.get(ZONES_CSV_URL, timeout=10); r.raise_for_status()
+    df = pd.read_csv(StringIO(r.content.decode("utf-8-sig")), dtype=str)
     if "Name" in df.columns:
         name_col = "Name"
     elif "Имя" in df.columns:
@@ -92,7 +102,7 @@ def load_zones_map():
         zones[uid] = {"region": region, "name": name}
     return zones
 
-# === Handlers ===
+# === HANDLERS ===
 def start(update: Update, context: CallbackContext):
     update.message.reply_text("Меню:", reply_markup=main_menu(""))
 
@@ -100,7 +110,7 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = str(update.effective_user.id)
     text    = update.message.text.strip()
 
-    # Зоны + имя
+    # 1) Загрузим зоны, имя и регион
     try:
         zones = load_zones_map()
     except Exception as e:
@@ -112,20 +122,20 @@ def handle_message(update: Update, context: CallbackContext):
     known_users.add(user_id)
     state = user_states.get(user_id, {})
 
+    # 2) Флаги admin / all
     is_admin = (region.lower() == "admin")
     is_all   = (region.upper() == "ALL")
     search_region = "ALL" if (is_admin or is_all) else region
 
-    # Режим broadcast для admin
+    # 3) Режим рассылки (admin)
     if state.get("mode") == "broadcast":
-        msg = text
         for uid in known_users:
-            try: bot.send_message(chat_id=int(uid), text=msg)
+            try: bot.send_message(chat_id=int(uid), text=text)
             except: pass
         user_states[user_id] = {}
         return update.message.reply_text("Рассылка выполнена.", reply_markup=main_menu(region))
 
-    # Главное меню
+    # 4) Главное меню
     if text == "Поиск":
         user_states[user_id] = {"mode": "search"}
         return update.message.reply_text("Введите номер счётчика", reply_markup=main_menu(region))
@@ -138,7 +148,7 @@ def handle_message(update: Update, context: CallbackContext):
         user_states[user_id] = {"mode": "broadcast"}
         return update.message.reply_text("Введите текст для рассылки всем:", reply_markup=main_menu(region))
 
-    # Справочная информация
+    # 5) Справочная информация
     if state.get("mode") == "help":
         if text == "Сечение кабеля (ток, мощность)":
             update.message.reply_photo(photo=IMG_CABLE_URL)
@@ -153,7 +163,7 @@ def handle_message(update: Update, context: CallbackContext):
             return update.message.reply_text("Выберите пункт справки:", reply_markup=HELP_MENU)
         return update.message.reply_text("Справка:", reply_markup=HELP_MENU)
 
-    # Ввод номера (search)
+    # 6) Ввод номера (search)
     if state.get("mode") == "search":
         norm = text.lstrip("0") or "0"
         found, matched = None, None
@@ -180,39 +190,35 @@ def handle_message(update: Update, context: CallbackContext):
         greet = f"Принял в работу, {user_name}" if user_name else "Принял в работу"
         return update.message.reply_text(greet, reply_markup=INFO_MENU)
 
-    # Информация по счётчику (info)
+    # 7) Информация по счётчику (info)
     if state.get("mode") == "info":
         if text == "Назад":
-            # возвращаемся в главное меню и сбрасываем состояние
             user_states[user_id] = {}
             return update.message.reply_text("Меню:", reply_markup=main_menu(region))
 
         st = user_states[user_id]
         number, region_info = st["number"], st["region"]
         df = DATA_CACHE.get(region_info)
-        row = df[df["Номер счетчика"].astype(str) == number]
+        row = df[df["Номер счетчика"].astype(str)==number]
         if row.empty:
             return update.message.reply_text("Данные не найдены.", reply_markup=INFO_MENU)
         if text == "Информация по договору":
-            cols = ["ТУ","Номер ТУСТЕК","Номер ТУ","ЛС / ЛС СТЕК",
-                    "Наименование договора","Вид потребителя","Субабонент"]
+            cols = ["ТУ","Номер ТУСТЕК","Номер ТУ","ЛС / ЛС СТЕК","Наименование договора","Вид потребителя","Субабонент"]
         elif text == "Информация по адресу подключения":
             cols = ["Сетевой участок","Населенный пункт","Улица","Дом","ТП"]
-        else:  # прибор учёта
-            cols = ["Номер счетчика","Состояние ТУ","Максимальная мощность",
-                    "Вид счетчика","Фазность","Госповерка счетчика",
-                    "Межповерочный интервал ПУ","Окончание срок поверки",
+        else:
+            cols = ["Номер счетчика","Состояние ТУ","Максимальная мощность","Вид счетчика","Фазность",
+                    "Госповерка счетчика","Межповерочный интервал ПУ","Окончание срок поверки",
                     "Проверка схемы дата","Последнее активное событие дата",
                     "Первичный ток ТТ (А)","Госповерка ТТ (А)","Межповерочный интервал ТТ"]
         data = row.iloc[0]
         msg = "\n".join(f"{c}: {data.get(c,'Нет данных')}" for c in cols)
-        # После каждого запроса показываем INFO_MENU, чтобы могли нажать другой
         return update.message.reply_text(msg, reply_markup=INFO_MENU)
 
-    # Fallback
+    # fallback
     update.message.reply_text("Меню:", reply_markup=main_menu(region))
 
-# === Webhook & запуск ===
+# === Webhook & run ===
 @app.route("/webhook", methods=["POST"])
 def webhook():
     dispatcher.process_update(Update.de_json(request.get_json(force=True), bot))
@@ -226,13 +232,13 @@ dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 if __name__ == "__main__":
-    # keep-awake (опционально)
+    # опциональный keep-awake
     def awake():
         try: requests.get(SELF_URL, timeout=5)
         except: pass
-        tt = threading.Timer(9*60, awake)
-        tt.daemon = True
-        tt.start()
+        t2 = threading.Timer(9*60, awake)
+        t2.daemon = True
+        t2.start()
     awake()
 
     bot.set_webhook(f"{SELF_URL}/webhook")
