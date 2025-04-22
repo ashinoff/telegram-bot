@@ -134,11 +134,11 @@ def handle_message(update: Update, context: CallbackContext):
     # подменю справки
     if state.get("mode") == "help":
         if text == "Сечение кабеля":
-            with open("сечение.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("сечение.jpg","rb") as f: update.message.reply_photo(photo=f)
         elif text == "Селективность":
-            with open("селективность.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("селективность.jpg","rb") as f: update.message.reply_photo(photo=f)
         elif text == "Формулы":
-            with open("формулы.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("формулы.jpg","rb") as f: update.message.reply_photo(photo=f)
         elif text == "Назад":
             user_states[user_id] = {}
             return update.message.reply_text("Меню:", reply_markup=main_menu(region))
