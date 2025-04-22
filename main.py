@@ -9,23 +9,24 @@ from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, Ca
 
 app = Flask(__name__)
 
-# === ENV ===
+# === Переменные окружения ===
 TOKEN           = os.getenv("TOKEN")
-SELF_URL        = os.getenv("SELF_URL")
-ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL")
+SELF_URL        = os.getenv("SELF_URL")      # https://your-bot-url.onrender.com
+ZONES_CSV_URL   = os.getenv("ZONES_CSV_URL") # CSV с колонками ID,Region,Name
 REES_SHEETS_MAP = {
-    p.split("=",1)[0]: p.split("=",1)[1]
-    for p in os.getenv("REES_SHEETS_MAP","").split(",") if p
+    pair.split("=",1)[0]: pair.split("=",1)[1]
+    for pair in os.getenv("REES_SHEETS_MAP","").split(",") if pair
 }
 
 bot        = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# состояние пользователей и зарегистрированные чаты
+# храним состояние: mode, number, region, name
 user_states = {}
+# список всех пользователей (для рассылки)
 known_users = set()
 
-# ========== ПРЕДЗАГРУЗКА РЭС-ТАБЛИЦ ==========
+# ========== ПРЕДЗАГРУЗКА ТАБЛИЦ РЭС ==========
 DATA_CACHE = {}
 def refresh_cache():
     for region, url in REES_SHEETS_MAP.items():
@@ -36,12 +37,11 @@ def refresh_cache():
             print(f"[cache] Loaded {region}")
         except Exception as e:
             print(f"[cache] Error loading {region}: {e}")
-    # планируем самовызыв через час
+    # планируем обновление через 1 час
     t = threading.Timer(3600, refresh_cache)
     t.daemon = True
     t.start()
 
-# сразу запускаем первый прогон
 refresh_cache()
 
 # ========== КЛАВИАТУРЫ ==========
@@ -68,10 +68,11 @@ INFO_MENU = ReplyKeyboardMarkup([
 
 # ========== ЗАГРУЗКА ЗОН ==========
 def load_zones_map():
-    r = requests.get(ZONES_CSV_URL, timeout=10); r.raise_for_status()
+    r = requests.get(ZONES_CSV_URL, timeout=10)
+    r.raise_for_status()
     text = r.content.decode("utf-8-sig")
     df = pd.read_csv(StringIO(text), dtype=str)
-    # ищем колонку с именем
+    # находим колонку с именем
     if "Name" in df.columns:
         name_col = "Name"
     elif "Имя" in df.columns:
@@ -97,7 +98,7 @@ def handle_message(update: Update, context: CallbackContext):
     user_id = str(update.effective_user.id)
     text    = update.message.text.strip()
 
-    # зоны + имя
+    # загрузим зоны и имя
     try:
         zones = load_zones_map()
     except Exception as e:
@@ -109,12 +110,18 @@ def handle_message(update: Update, context: CallbackContext):
     known_users.add(user_id)
     state = user_states.get(user_id, {})
 
-    # режим рассылки
+    # определяем "search_region" для админа или обычного
+    is_admin = (region.lower() == "admin")
+    search_region = "ALL" if is_admin else region
+
+    # режим рассылки для админа
     if state.get("mode") == "broadcast":
         msg = text
         for uid in known_users:
-            try: bot.send_message(chat_id=int(uid), text=msg)
-            except: pass
+            try:
+                bot.send_message(chat_id=int(uid), text=msg)
+            except:
+                pass
         user_states[user_id] = {}
         return update.message.reply_text("Рассылка выполнена.", reply_markup=main_menu(region))
 
@@ -127,18 +134,21 @@ def handle_message(update: Update, context: CallbackContext):
         user_states[user_id] = {"mode": "help"}
         return update.message.reply_text("Справка:", reply_markup=HELP_MENU)
 
-    if text == "Уведомление всем" and region.lower()=="admin":
+    if text == "Уведомление всем" and is_admin:
         user_states[user_id] = {"mode": "broadcast"}
         return update.message.reply_text("Введите текст для рассылки всем:", reply_markup=main_menu(region))
 
     # подменю справки
     if state.get("mode") == "help":
         if text == "Сечение кабеля":
-            with open("сечение.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("сечение.jpeg", "rb") as f:
+                update.message.reply_photo(photo=f)
         elif text == "Селективность":
-            with open("селективность.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("селективность.jpeg", "rb") as f:
+                update.message.reply_photo(photo=f)
         elif text == "Формулы":
-            with open("формулы.jpeg","rb") as f: update.message.reply_photo(photo=f)
+            with open("формулы.jpeg", "rb") as f:
+                update.message.reply_photo(photo=f)
         elif text == "Назад":
             user_states[user_id] = {}
             return update.message.reply_text("Меню:", reply_markup=main_menu(region))
@@ -146,44 +156,44 @@ def handle_message(update: Update, context: CallbackContext):
             return update.message.reply_text("Выберите пункт справки:", reply_markup=HELP_MENU)
         return update.message.reply_text("Справка:", reply_markup=HELP_MENU)
 
-    # ввод номера
-    if text not in ("Информация по договору","Информация по адресу подключения","Информация по прибору учёта"):
+    # ввод номера счётчика (режим search)
+    if state.get("mode") == "search":
         norm = text.lstrip("0") or "0"
         found, matched = None, None
-        if region.upper()=="ALL":
+        if search_region == "ALL":
             for reg, df in DATA_CACHE.items():
                 ser = df["Номер счетчика"].astype(str)
-                norm_ser = ser.str.lstrip("0").replace("","0")
-                if (norm_ser==norm).any():
-                    found, matched = reg, ser[norm_ser==norm].iloc[0]
+                norm_ser = ser.str.lstrip("0").replace("", "0")
+                if (norm_ser == norm).any():
+                    found, matched = reg, ser[norm_ser == norm].iloc[0]
                     break
             if not found:
                 return update.message.reply_text("Номер не найден ни в одном регионе.", reply_markup=main_menu(region))
         else:
-            df = DATA_CACHE.get(region)
+            df = DATA_CACHE.get(search_region)
             if df is None:
-                return update.message.reply_text(f"Таблица для региона «{region}» ещё не загружена.")
+                return update.message.reply_text(f"Таблица для региона «{search_region}» ещё не загружена.")
             ser = df["Номер счетчика"].astype(str)
-            norm_ser = ser.str.lstrip("0").replace("","0")
-            if not (norm_ser==norm).any():
+            norm_ser = ser.str.lstrip("0").replace("", "0")
+            if not (norm_ser == norm).any():
                 return update.message.reply_text("Номер не найден. Проверьте ввод.", reply_markup=main_menu(region))
-            found, matched = region, ser[norm_ser==norm].iloc[0]
+            found, matched = search_region, ser[norm_ser == norm].iloc[0]
 
-        user_states[user_id] = {"mode":"info","number":matched,"region":found}
+        user_states[user_id] = {"mode": "info", "number": matched, "region": found}
         greet = f"Принял в работу, {user_name}" if user_name else "Принял в работу"
         return update.message.reply_text(greet, reply_markup=INFO_MENU)
 
-    # информация по счётчику
-    st = user_states.get(user_id,{})
-    number, region_info = st.get("number"), st.get("region")
-    if number and region_info:
+    # показ информации по счётчику (режим info)
+    if state.get("mode") == "info":
+        number = state.get("number")
+        region_info = state.get("region")
         df = DATA_CACHE.get(region_info)
-        row = df[df["Номер счетчика"].astype(str)==number]
+        row = df[df["Номер счетчика"].astype(str) == number]
         if row.empty:
             return update.message.reply_text("Данные не найдены.", reply_markup=main_menu(region))
-        if text=="Информация по договору":
+        if text == "Информация по договору":
             cols = ["ТУ","Номер ТУСТЕК","Номер ТУ","ЛС / ЛС СТЕК","Наименование договора","Вид потребителя","Субабонент"]
-        elif text=="Информация по адресу подключения":
+        elif text == "Информация по адресу подключения":
             cols = ["Сетевой участок","Населенный пункт","Улица","Дом","ТП"]
         else:
             cols = ["Номер счетчика","Состояние ТУ","Максимальная мощность","Вид счетчика","Фазность",
@@ -197,7 +207,7 @@ def handle_message(update: Update, context: CallbackContext):
     # fallback
     update.message.reply_text("Меню:", reply_markup=main_menu(region))
 
-# ========== WEBHOOK ==========
+# ========== WEBHOOK & STARTUP ==========
 @app.route("/webhook", methods=["POST"])
 def webhook():
     dispatcher.process_update(Update.de_json(request.get_json(force=True), bot))
@@ -211,10 +221,12 @@ dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 if __name__ == "__main__":
-    # keep-awake (если хотите)
+    # опциональный keep-awake
     def awake():
-        try: requests.get(SELF_URL, timeout=5)
-        except: pass
+        try:
+            requests.get(SELF_URL, timeout=5)
+        except:
+            pass
         t = threading.Timer(9*60, awake)
         t.daemon = True
         t.start()
