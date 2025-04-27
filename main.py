@@ -23,13 +23,13 @@ VOLS_SHEETS_URL = os.getenv("VOLS_SHEETS_URL")
 bot        = Bot(token=TOKEN)
 dispatcher = Dispatcher(bot, None, use_context=True)
 
-# === HELP IMAGES (Google Drive export links) ===
+# === HELP IMAGES ===
 BASE_DRIVE_URL      = "https://drive.google.com/uc?export=download&id="
 IMG_FORMULAS_URL    = BASE_DRIVE_URL + "1StUq8JSdpwU1QvJJ6F3W3dHZnReF6kt8"
 IMG_CABLE_URL       = BASE_DRIVE_URL + "11LaH-BvqtUPj2wTQ31wl-1Qrs2aRGb0I"
 IMG_SELECTIVITY_URL = BASE_DRIVE_URL + "11q0orVtOJ_UTk5UVLEn5yGUOeCsWQkaX"
 
-# === UTILITY: make any Google Sheets URL into xlsx-export URL ===
+# === HELPERS ===
 def make_export_url(raw_url: str) -> str:
     if "/pubhtml" in raw_url:
         return raw_url.split("/pubhtml")[0] + "/pub?output=xlsx"
@@ -37,8 +37,7 @@ def make_export_url(raw_url: str) -> str:
         return raw_url
     m = re.search(r"/d/(?:e/)?([^/]+)", raw_url)
     if m:
-        sid = m.group(1)
-        return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx"
+        return f"https://docs.google.com/spreadsheets/d/{m.group(1)}/export?format=xlsx"
     return raw_url
 
 # === CACHE REES SHEETS ===
@@ -51,14 +50,11 @@ def refresh_cache():
             DATA_CACHE[region] = pd.read_excel(BytesIO(r.content), dtype=str)
         except Exception as e:
             print(f"[cache] Error loading {region}: {e}")
-    t = threading.Timer(3600, refresh_cache)
-    t.daemon = True
-    t.start()
+    t = threading.Timer(3600, refresh_cache); t.daemon=True; t.start()
 
 # === CACHE VOLS DATA ===
 VOLS_DF     = pd.DataFrame()
 VOLS_TP_COL = None
-
 def refresh_vols():
     global VOLS_DF, VOLS_TP_COL
     try:
@@ -72,29 +68,30 @@ def refresh_vols():
         VOLS_DF = df
     except Exception as e:
         print(f"[cache] Error loading VOLS: {e}")
-    t = threading.Timer(3600, refresh_vols)
-    t.daemon = True
-    t.start()
+    t = threading.Timer(3600, refresh_vols); t.daemon=True; t.start()
 
 refresh_cache()
 refresh_vols()
 
-# === LOAD ZONES CSV (force string and strip whitespace) ===
+# === LOAD ZONES CSV (strip headers + force strings) ===
 def load_zones_map():
-    r  = requests.get(ZONES_CSV_URL, timeout=10); r.raise_for_status()
+    r = requests.get(ZONES_CSV_URL, timeout=10); r.raise_for_status()
     df = pd.read_csv(StringIO(r.content.decode("utf-8-sig")), dtype=str).fillna("")
 
-    # ensure Region is a stripped string
+    # strip whitespace/BOM from column names
+    df.columns = df.columns.str.strip()
+
+    # ensure Region column is trimmed
     if "Region" in df.columns:
         df["Region"] = df["Region"].astype(str).str.strip()
 
-    # detect and strip the region_tp column (any header containing "тп")
+    # find Region_TP as any header containing "тп"
     tp_cols = [c for c in df.columns if "тп" in c.lower()]
     region_tp_col = tp_cols[0] if tp_cols else None
     if region_tp_col:
         df[region_tp_col] = df[region_tp_col].astype(str).str.strip()
 
-    # determine name column
+    # detect user name column
     if "Name" in df.columns:
         name_col = "Name"
     elif "Имя" in df.columns:
@@ -119,7 +116,8 @@ def load_zones_map():
 # === KEYBOARDS ===
 def main_menu(region: str, region_tp: str):
     buttons = []
-    if region and region.upper() not in ("", "ALL"):
+    # now show search button for ANY non-empty region, including "ALL"
+    if region:
         buttons.append("Поиск по прибору учета")
     buttons.append("Справка")
     if region_tp:
@@ -147,7 +145,7 @@ VOLS_MENU = ReplyKeyboardMarkup([
     ["Назад"]
 ], resize_keyboard=True)
 
-# === USER STATES ===
+# === USER STATE ===
 user_states = {}
 known_users = set()
 
@@ -158,10 +156,7 @@ def start(update: Update, context: CallbackContext):
         info = load_zones_map().get(uid, {})
     except:
         info = {}
-    update.message.reply_text(
-        "Меню:",
-        reply_markup=main_menu(info.get("region",""), info.get("region_tp",""))
-    )
+    update.message.reply_text("Меню:", reply_markup=main_menu(info.get("region",""), info.get("region_tp","")))
 
 def handle_message(update: Update, context: CallbackContext):
     uid  = str(update.effective_user.id)
@@ -184,7 +179,7 @@ def handle_message(update: Update, context: CallbackContext):
     is_all     = region.upper() == "ALL"
     search_reg = "ALL" if (is_admin or is_all) else region
 
-    # --- BROADCAST MODE ---
+    # -- broadcast --
     if state.get("mode") == "broadcast":
         for u in known_users:
             try: bot.send_message(chat_id=int(u), text=txt)
@@ -192,37 +187,37 @@ def handle_message(update: Update, context: CallbackContext):
         user_states[uid] = {}
         return update.message.reply_text("Рассылка выполнена.", reply_markup=main_menu(region, region_tp))
 
-    # --- Поиск по прибору учета ---
+    # -- Поиск по прибору учета --
     if txt == "Поиск по прибору учета":
         if not region:
             return update.message.reply_text("У вас нет доступа.")
         user_states[uid] = {"mode": "search"}
         return update.message.reply_text("Введите номер счетчика:", reply_markup=main_menu(region, region_tp))
 
-    # --- Справка ---
+    # -- Справка --
     if txt == "Справка":
         user_states[uid] = {"mode": "help"}
         return update.message.reply_text("Справка:", reply_markup=HELP_MENU)
 
-    # --- Админская рассылка ---
+    # -- Админская рассылка --
     if txt == "Уведомление всем" and is_admin:
         user_states[uid] = {"mode": "broadcast"}
         return update.message.reply_text("Введите текст для рассылки всем:", reply_markup=main_menu(region, region_tp))
 
-    # --- ВОЛС: главное подменю ---
+    # -- ВОЛС меню --
     if txt == "ВОЛС":
         if not region_tp:
             return update.message.reply_text("У вас нет доступа.", reply_markup=main_menu(region, region_tp))
-        user_states[uid] = {"mode": "vols_menu", "region_tp": region_tp}
+        user_states[uid] = {"mode": "vols_menu"}
         return update.message.reply_text("Меню ВОЛС:", reply_markup=VOLS_MENU)
 
-    # --- СХЕМЫ (заглушка) ---
+    # -- СХЕМЫ (заглушка) --
     if txt == "СХЕМЫ 0,4 кВ":
         if not region_tp:
             return update.message.reply_text("У вас нет доступа.", reply_markup=main_menu(region, region_tp))
         return update.message.reply_text("Функция пока недоступна.", reply_markup=main_menu(region, region_tp))
 
-    # --- HELP MODE ---
+    # -- HELP MODE --
     if state.get("mode") == "help":
         if txt == "Сечение кабеля (ток, мощность)":
             update.message.reply_photo(photo=IMG_CABLE_URL)
@@ -237,7 +232,7 @@ def handle_message(update: Update, context: CallbackContext):
             return update.message.reply_text("Выберите пункт справки:", reply_markup=HELP_MENU)
         return update.message.reply_text("Справка:", reply_markup=HELP_MENU)
 
-    # --- SEARCH COUNTER MODE ---
+    # -- SEARCH COUNTER --
     if state.get("mode") == "search":
         norm = txt.strip().lstrip("0") or "0"
         found = matched = None
@@ -264,15 +259,15 @@ def handle_message(update: Update, context: CallbackContext):
         greet = f"Принял в работу, {name}" if name else "Принял в работу"
         return update.message.reply_text(greet, reply_markup=INFO_MENU)
 
-    # --- INFO COUNTER MODE ---
+    # -- INFO COUNTER --
     if state.get("mode") == "info":
         if txt == "Назад":
             user_states[uid] = {}
             return update.message.reply_text("Меню:", reply_markup=main_menu(region, region_tp))
 
-        st   = user_states[uid]
-        df   = DATA_CACHE.get(st["region"], pd.DataFrame())
-        row  = df[df["Номер счетчика"].astype(str) == st["number"]]
+        st  = user_states[uid]
+        df  = DATA_CACHE.get(st["region"], pd.DataFrame())
+        row = df[df["Номер счетчика"].astype(str) == st["number"]]
         if row.empty:
             return update.message.reply_text("Данные не найдены.", reply_markup=INFO_MENU)
 
@@ -281,16 +276,21 @@ def handle_message(update: Update, context: CallbackContext):
         elif txt == "Информация по подключению":
             cols = ["Номер счетчика","Сетевой участок","Населенный пункт","Улица","Дом","Подстанция","Фидер10","ТП"]
         else:
-            cols = ["Номер счетчика","Максимальная мощность","Вид счетчика","Фазность","Госповерка счетчика","Межповерочный интервал ПУ","Окончание срок поверки","Проверка схемы дата","Последнее активное событие дата","Тип ТТ","Первичный ток ТТ","Заводской номер ТТ (А)","Заводской номер ТТ (В)","Заводской номер ТТ (С)","Госповерка ТТ","Межповерочный интервал ТТ","Окончание срок поверки ТТ","Тип ТН","Заводской номер ТН","Госповерка ТН","Межповерочный интервал ТН","Окончание срок поверки ТН"]
+            cols = [
+                "Номер счетчика","Максимальная мощность","Вид счетчика","Фазность",
+                "Госповерка счетчика","Межповерочный интервал ПУ","Окончание срок поверки",
+                "Проверка схемы дата","Последнее активное событие дата",
+                "Тип ТТ","Первичный ток ТТ",
+                "Заводской номер ТТ (А)","Заводской номер ТТ (В)","Заводской номер ТТ (С)",
+                "Госповерка ТТ","Межповерочный интервал ТТ","Окончание срок поверки ТТ",
+                "Тип ТН","Заводской номер ТН","Госповерка ТН",
+                "Межповерочный интервал ТН","Окончание срок поверки ТН"
+            ]
         data = row.iloc[0]
-        lines = []
-        for c in cols:
-            v = data.get(c)
-            if pd.notna(v) and str(v).strip() not in ("","nan"):
-                lines.append(f"{c}: {v}")
+        lines = [f"{c}: {data[c]}" for c in cols if pd.notna(data.get(c)) and str(data.get(c)).strip()]
         return update.message.reply_text("\n".join(lines), reply_markup=INFO_MENU)
 
-    # --- VOLS MENU ---
+    # -- VOLS MENU --
     if state.get("mode") == "vols_menu":
         if txt == "Назад":
             user_states[uid] = {}
@@ -302,7 +302,7 @@ def handle_message(update: Update, context: CallbackContext):
             user_states[uid] = {"mode":"vols_provider_input","region_tp":region_tp}
             return update.message.reply_text("Введите имя контрагента:", reply_markup=ReplyKeyboardMarkup([["Назад"]], resize_keyboard=True))
 
-    # --- VOLS: SEARCH BY TP ---
+    # -- VOLS: SEARCH BY TP --
     if state.get("mode") == "vols_tp_input":
         if txt == "Назад":
             user_states[uid] = {"mode":"vols_menu","region_tp":region_tp}
@@ -323,7 +323,7 @@ def handle_message(update: Update, context: CallbackContext):
         user_states[uid] = {"mode":"vols_tp_list","df_tp":df_tp,"label_map":label_map,"region_tp":region_tp}
         return update.message.reply_text(f"На ТП {tp} найдено {len(df_tp)} договор(ов):", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
 
-    # --- VOLS: LIST TP PROVIDERS ---
+    # -- VOLS: LIST TP PROVIDERS --
     if state.get("mode") == "vols_tp_list":
         if txt == "Новый поиск":
             user_states[uid] = {"mode":"vols_tp_input","region_tp":region_tp}
@@ -342,7 +342,7 @@ def handle_message(update: Update, context: CallbackContext):
 
         df_sel = state["df_tp"][state["df_tp"]["Наименование контрагента (собственника ВОЛС)"] == name]
         for _, row in df_sel.iterrows():
-            update.message.reply_text( 
+            update.message.reply_text(
                 f"РЭС: {row.get('РЭС','')}\n"
                 f"ТП:  {row.get('Наименование ТП','')}\n"
                 f"Фидер: {row.get('ФИДЕР','')}\n"
@@ -352,12 +352,11 @@ def handle_message(update: Update, context: CallbackContext):
         kb = [[lbl] for lbl in state["label_map"]] + [["Новый поиск"],["Назад"]]
         return update.message.reply_text("Можно выбрать другого контрагента или Назад.", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
-    # --- VOLS: SEARCH BY PROVIDER ---
+    # -- VOLS: SEARCH BY PROVIDER --
     if state.get("mode") == "vols_provider_input":
         if txt == "Назад":
             user_states[uid] = {"mode":"vols_menu","region_tp":region_tp}
             return update.message.reply_text("Меню ВОЛС:", reply_markup=VOLS_MENU)
-
         prov = txt.strip().lower()
         df_p = VOLS_DF[
             VOLS_DF["Наименование контрагента (собственника ВОЛС)"]
@@ -365,17 +364,15 @@ def handle_message(update: Update, context: CallbackContext):
         ]
         if region_tp.upper() != "ALL":
             df_p = df_p[df_p["РЭС"].astype(str).str.strip() == region_tp]
-
         if df_p.empty:
             return update.message.reply_text("Контрагент не найден.", reply_markup=ReplyKeyboardMarkup([["Новый поиск"],["Назад"]], resize_keyboard=True))
-
         vc = df_p[VOLS_TP_COL].astype(str).value_counts()
         label_map = {f"{tp} ({cnt} шт)": tp for tp,cnt in vc.items()}
         buttons   = [[lbl] for lbl in label_map] + [["Новый поиск"],["Назад"]]
         user_states[uid] = {"mode":"vols_provider_list","df_p":df_p,"label_map":label_map,"region_tp":region_tp}
         return update.message.reply_text(f"Найдено договоров: {len(df_p)}", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True))
 
-    # --- VOLS: LIST PROVIDER TPs ---
+    # -- VOLS: LIST PROVIDER TPs --
     if state.get("mode") == "vols_provider_list":
         if txt == "Новый поиск":
             user_states[uid] = {"mode":"vols_provider_input","region_tp":region_tp}
@@ -399,7 +396,7 @@ def handle_message(update: Update, context: CallbackContext):
             reply_markup=ReplyKeyboardMarkup([["Новый поиск"],["Назад"]], resize_keyboard=True)
         )
 
-    # --- FALLBACK ---
+    # -- FALLBACK --
     user_states[uid] = {}
     return update.message.reply_text("Меню:", reply_markup=main_menu(region, region_tp))
 
@@ -417,14 +414,10 @@ dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
 if __name__ == "__main__":
-    # keep-alive ping
     def awake():
         try: requests.get(SELF_URL, timeout=5)
         except: pass
-        t = threading.Timer(9*60, awake)
-        t.daemon = True
-        t.start()
+        t = threading.Timer(9*60, awake); t.daemon=True; t.start()
     awake()
-
     bot.set_webhook(f"{SELF_URL}/webhook")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
